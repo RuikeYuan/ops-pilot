@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: opspilot
+    env: docker
+    plan: free
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health/ready
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: OPS_TOKEN
+        generateValue: true
+      - key: OPS_DEMO
+        value: false
+      - key: OPS_SECURE_COOKIE
+        value: true
+      - key: OPS_WORKSPACE
+        value: My studio
+      - key: DATABASE_URL
+        fromDatabase:
+          name: opspilot-db
+          property: connectionString
+
+databases:
+  - name: opspilot-db
+    databaseName: opspilot
+    user: opspilot
+    plan: free

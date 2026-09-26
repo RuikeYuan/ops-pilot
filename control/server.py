@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -19,8 +20,9 @@ from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
-from control.db import BusinessRun, Check, Client, Deployment, Event, Incident, Project, database
+from control.db import Account, BusinessRun, Check, Client, Deployment, Event, Incident, Project, database
 from control.business import BusinessReceipt, STEP_LABELS, MESSAGES, step_evidence
 from control.probes import parse_url, probe
 
@@ -33,6 +35,11 @@ class Login(BaseModel):
     demo: bool = False
     email: str = ''
     password: str = ''
+
+
+class Registration(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=12, max_length=128)
 
 
 class NewClient(BaseModel):
@@ -74,6 +81,10 @@ def digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def password_digest(password, salt):
+    return hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 310_000).hex()
+
+
 def create_app(db_url=None, demo=None, scheduler=True):
     demo = os.getenv('OPS_DEMO', 'false').lower() == 'true' if demo is None else demo
     operator_token = os.getenv('OPS_TOKEN', '')
@@ -86,16 +97,16 @@ def create_app(db_url=None, demo=None, scheduler=True):
     secure = os.getenv('OPS_SECURE_COOKIE', 'false').lower() == 'true'
     admin_email = os.getenv('OPS_ADMIN_EMAIL', '').strip().lower()
     admin_password = os.getenv('OPS_ADMIN_PASSWORD', '')
-    allowed_emails = {email.strip().lower() for email in os.getenv('OPS_AUTH_EMAILS', '').split(',') if email.strip()}
-    if admin_email:
-        allowed_emails.add(admin_email)
     google_client_id = os.getenv('GOOGLE_CLIENT_ID', '')
     google_client_secret = os.getenv('GOOGLE_CLIENT_SECRET', '')
-    google_enabled = bool(google_client_id and google_client_secret and allowed_emails)
+    google_enabled = bool(google_client_id and google_client_secret)
     session_secret = os.getenv('OPS_SESSION_SECRET') or operator_token or secrets.token_urlsafe(32)
 
-    def event(db, project_id, kind, detail):
-        db.add(Event(project_id=project_id, kind=kind, detail=detail))
+    def event(db, project_id, kind, detail, workspace_id='legacy'):
+        if project_id:
+            project = db.get(Project, project_id)
+            workspace_id = db.get(Client, project.client_id).workspace_id
+        db.add(Event(project_id=project_id, kind=kind, detail=detail, workspace_id=workspace_id))
 
     def latest(db, pid):
         return db.scalar(select(Check).where(Check.project_id == pid).order_by(Check.at.desc()))
@@ -173,7 +184,7 @@ def create_app(db_url=None, demo=None, scheduler=True):
                 pass
         engine.dispose()
 
-    app = FastAPI(title='OpsPilot control plane', version='0.2.0', lifespan=lifespan)
+    app = FastAPI(title='OpsPilot control plane', version='0.5.0', lifespan=lifespan)
     app.add_middleware(SessionMiddleware, secret_key=session_secret, same_site='lax', https_only=secure)
     app.state.session_factory = Session
     app.state.run_check = run_check
@@ -201,10 +212,25 @@ def create_app(db_url=None, demo=None, scheduler=True):
     def auth(request: Request):
         bearer = request.headers.get('authorization', '').removeprefix('Bearer ')
         if operator_token and hmac.compare_digest(bearer, operator_token):
-            return
+            return 'legacy'
         key = request.cookies.get('ops_session', '')
-        if sessions.get(digest(key), 0) < time.time():
+        session = sessions.get(digest(key))
+        if not session or session['expires_at'] < time.time():
             raise HTTPException(401, 'Sign in to your workspace')
+        return session['user_id'] or 'legacy'
+
+    def owned_client(db, cid, workspace_id):
+        client = db.get(Client, cid)
+        if not client or client.workspace_id != workspace_id:
+            raise HTTPException(404, 'Client not found')
+        return client
+
+    def owned_project(db, pid, workspace_id):
+        project = db.get(Project, pid)
+        if not project:
+            raise HTTPException(404, 'Project not found')
+        owned_client(db, project.client_id, workspace_id)
+        return project
 
     def project_auth(request, p):
         token = request.headers.get('authorization', '').removeprefix('Bearer ')
@@ -213,7 +239,7 @@ def create_app(db_url=None, demo=None, scheduler=True):
 
     @app.get('/health/live')
     def live():
-        return {'status': 'alive', 'version': '0.2.0'}
+        return {'status': 'alive', 'version': '0.5.0'}
 
     @app.get('/health/ready')
     def ready():
@@ -224,7 +250,7 @@ def create_app(db_url=None, demo=None, scheduler=True):
 
     @app.get('/api/config')
     def config():
-        return {'demo': demo, 'password_login': bool(admin_email and admin_password), 'google_login': google_enabled}
+        return {'demo': demo, 'password_login': True, 'google_login': google_enabled, 'registration': True}
 
     oauth = OAuth()
     if google_enabled:
@@ -236,32 +262,71 @@ def create_app(db_url=None, demo=None, scheduler=True):
             client_kwargs={'scope': 'openid email profile'},
         )
 
-    def issue_session(response: Response):
+    def issue_session(response: Response, user_id=None):
         key = secrets.token_urlsafe(32)
-        sessions[digest(key)] = time.time() + 28800
+        sessions[digest(key)] = {'expires_at': time.time() + 28800, 'user_id': user_id}
         response.set_cookie('ops_session', key, httponly=True, samesite='strict', secure=secure, max_age=28800)
+
+    def check_auth_rate_limit(request):
+        host = request.client.host if request.client else 'unknown'
+        recent = [t for t in attempts.get(host, []) if t > time.time() - 300]
+        if len(recent) >= 10:
+            raise HTTPException(429, 'Too many attempts; try again in five minutes')
+        return host, recent
+
+    def normalized_email(email):
+        email = email.strip().lower()
+        if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email):
+            raise HTTPException(422, 'Enter a valid email address')
+        return email
 
     @app.post('/api/session')
     def login(body: Login, request: Request, response: Response):
-        host = request.client.host if request.client else 'unknown'
-        recent = [t for t in attempts.get(host, []) if t > time.time() - 300]
+        host, recent = check_auth_rate_limit(request)
         attempts[host] = recent
-        if len(recent) >= 10:
-            raise HTTPException(429, 'Too many attempts; try again in five minutes')
         email = body.email.strip().lower()
         token_ok = bool(operator_token and hmac.compare_digest(body.token, operator_token))
-        password_ok = bool(
+        with Session() as db:
+            account = db.scalar(select(Account).where(Account.email == email)) if email else None
+        salt = account.password_salt if account and account.password_salt else '00' * 16
+        computed_hash = password_digest(body.password, salt) if body.password else ''
+        account_password_ok = bool(
+            account and account.password_hash
+            and hmac.compare_digest(computed_hash, account.password_hash)
+        )
+        admin_password_ok = bool(
             admin_email and admin_password
             and hmac.compare_digest(email.encode(), admin_email.encode())
             and hmac.compare_digest(body.password.encode(), admin_password.encode())
         )
-        if not ((body.demo and demo) or token_ok or password_ok):
-            recent.append(time.time())
+        if not ((body.demo and demo) or token_ok or account_password_ok or admin_password_ok):
+            attempts[host] = recent + [time.time()]
             raise HTTPException(401, 'Invalid sign-in details')
-        for k, expiry in list(sessions.items()):
-            if expiry < time.time():
+        for k, session in list(sessions.items()):
+            if session['expires_at'] < time.time():
                 del sessions[k]
-        issue_session(response)
+        issue_session(response, account.id if account_password_ok else None)
+        return {'ok': True}
+
+    @app.post('/api/register')
+    def register(body: Registration, request: Request, response: Response):
+        host, recent = check_auth_rate_limit(request)
+        attempts[host] = recent + [time.time()]
+        email = normalized_email(body.email)
+        salt = secrets.token_hex(16)
+        account = Account(email=email, password_salt=salt,
+                          password_hash=password_digest(body.password, salt))
+        with lock, Session() as db:
+            if db.scalar(select(Account.id).where(Account.email == email)):
+                raise HTTPException(409, 'An account with this email already exists')
+            db.add(account)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(409, 'An account with this email already exists')
+            user_id = account.id
+        issue_session(response, user_id)
         return {'ok': True}
 
     @app.get('/api/auth/google')
@@ -282,10 +347,23 @@ def create_app(db_url=None, demo=None, scheduler=True):
             log.exception('Google OAuth callback failed')
             return PlainTextResponse('Google sign-in failed. Return to OpsPilot and try again.', status_code=401)
         email = str(userinfo.get('email', '')).strip().lower()
-        if userinfo.get('email_verified') is not True or email not in allowed_emails:
-            return PlainTextResponse('This Google account is not authorized for this workspace.', status_code=403)
+        if userinfo.get('email_verified') is not True or not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email):
+            return PlainTextResponse('Google did not provide a verified email address.', status_code=403)
+        with lock, Session() as db:
+            account = db.scalar(select(Account).where(Account.email == email))
+            if account and account.password_hash:
+                return PlainTextResponse('This email uses password sign-in. Sign in with your password; automatic account linking is disabled.', status_code=409)
+            if not account:
+                account = Account(email=email)
+                db.add(account)
+                try:
+                    db.commit()
+                except IntegrityError:
+                    db.rollback()
+                    account = db.scalar(select(Account).where(Account.email == email))
+            user_id = account.id
         response = RedirectResponse('/', status_code=303)
-        issue_session(response)
+        issue_session(response, user_id)
         return response
 
     @app.delete('/api/session')
@@ -295,12 +373,13 @@ def create_app(db_url=None, demo=None, scheduler=True):
         return {'ok': True}
 
     @app.get('/api/workspace', dependencies=[Depends(auth)])
-    def workspace():
+    def workspace(workspace_id: str = Depends(auth)):
         with Session() as db:
-            clients = [{'id': c.id, 'name': c.name, 'contact': c.contact, 'color': c.color} for c in db.scalars(select(Client))]
+            clients = [{'id': c.id, 'name': c.name, 'contact': c.contact, 'color': c.color} for c in db.scalars(select(Client).where(Client.workspace_id == workspace_id))]
+            project_ids = select(Project.id).join(Client).where(Client.workspace_id == workspace_id)
             projects = []
             now = time.time()
-            for p in db.scalars(select(Project).order_by(Project.created)):
+            for p in db.scalars(select(Project).where(Project.id.in_(project_ids)).order_by(Project.created)):
                 status, c = state(db, p)
                 run = db.scalar(select(BusinessRun).where(BusinessRun.project_id == p.id).order_by(BusinessRun.observed_at.desc())) if p.mode == 'business' else None
                 checks = list(db.scalars(select(Check).where(Check.project_id == p.id, Check.at >= now - 86400).order_by(Check.at)))
@@ -314,29 +393,29 @@ def create_app(db_url=None, demo=None, scheduler=True):
                                  'business_check': {'run_id': run.id, 'workflow': run.workflow, 'observed_at': stamp(run.observed_at), 'steps': step_evidence(json.loads(run.steps_json))} if run else None})
             incidents = [{'id': i.id, 'project_id': i.project_id, 'title': i.title, 'status': i.status, 'severity': i.severity,
                           'opened': stamp(i.opened), 'resolved': stamp(i.resolved), 'evidence': i.evidence, 'note': i.note}
-                         for i in db.scalars(select(Incident).order_by(Incident.opened.desc()).limit(100))]
+                         for i in db.scalars(select(Incident).where(Incident.project_id.in_(project_ids)).order_by(Incident.opened.desc()).limit(100))]
             events = [{'id': e.id, 'project_id': e.project_id, 'at': stamp(e.at), 'kind': e.kind, 'detail': e.detail}
-                      for e in db.scalars(select(Event).order_by(Event.at.desc()).limit(80))]
+                      for e in db.scalars(select(Event).where(Event.workspace_id == workspace_id).order_by(Event.at.desc()).limit(80))]
             deployments = [{'id': d.id, 'project_id': d.project_id, 'at': stamp(d.at), 'version': d.version,
-                            'commit': d.commit, 'status': d.status} for d in db.scalars(select(Deployment).order_by(Deployment.at.desc()).limit(50))]
-            return {'name': 'Northstar Studio' if demo else os.getenv('OPS_WORKSPACE', 'My studio'), 'demo': demo,
+                            'commit': d.commit, 'status': d.status} for d in db.scalars(select(Deployment).where(Deployment.project_id.in_(project_ids)).order_by(Deployment.at.desc()).limit(50))]
+            return {'name': ('Northstar Studio' if demo else os.getenv('OPS_WORKSPACE', 'My studio')) if workspace_id == 'legacy' else 'My workspace', 'demo': demo and workspace_id == 'legacy',
                     'clients': clients, 'projects': projects, 'incidents': incidents, 'events': events, 'deployments': deployments,
                     'at': stamp(now), 'region': 'Local workspace' if demo else os.getenv('OPS_REGION', 'Self-hosted')}
 
     @app.post('/api/clients', dependencies=[Depends(auth)])
-    def add_client(body: NewClient):
+    def add_client(body: NewClient, workspace_id: str = Depends(auth)):
         if not body.name.strip():
             raise HTTPException(422, 'Client name is required')
         with lock, Session() as db:
-            c = Client(name=body.name.strip(), contact=body.contact.strip())
+            c = Client(name=body.name.strip(), contact=body.contact.strip(), workspace_id=workspace_id)
             db.add(c)
             db.flush()
-            event(db, None, 'client_added', f'Added client {c.name}')
+            event(db, None, 'client_added', f'Added client {c.name}', workspace_id)
             db.commit()
             return {'id': c.id}
 
     @app.post('/api/projects', dependencies=[Depends(auth)])
-    def add_project(body: NewProject):
+    def add_project(body: NewProject, workspace_id: str = Depends(auth)):
         if not body.name.strip():
             raise HTTPException(422, 'Project name is required')
         if body.mode == 'http':
@@ -345,8 +424,7 @@ def create_app(db_url=None, demo=None, scheduler=True):
             except ValueError as exc:
                 raise HTTPException(422, str(exc))
         with lock, Session() as db:
-            if not db.get(Client, body.client_id):
-                raise HTTPException(404, 'Client not found')
+            owned_client(db, body.client_id, workspace_id)
             token = secrets.token_urlsafe(32)
             p = Project(**body.model_dump(), token_hash=digest(token))
             db.add(p)
@@ -356,11 +434,9 @@ def create_app(db_url=None, demo=None, scheduler=True):
             return {'id': p.id, 'token': token}
 
     @app.post('/api/projects/{pid}/token', dependencies=[Depends(auth)])
-    def rotate(pid: str):
+    def rotate(pid: str, workspace_id: str = Depends(auth)):
         with lock, Session() as db:
-            p = db.get(Project, pid)
-            if not p:
-                raise HTTPException(404, 'Project not found')
+            p = owned_project(db, pid, workspace_id)
             token = secrets.token_urlsafe(32)
             p.token_hash = digest(token)
             event(db, pid, 'token_rotated', 'Project ingestion token rotated; previous token revoked')
@@ -368,7 +444,9 @@ def create_app(db_url=None, demo=None, scheduler=True):
             return {'token': token}
 
     @app.post('/api/projects/{pid}/check', dependencies=[Depends(auth)])
-    def check(pid: str):
+    def check(pid: str, workspace_id: str = Depends(auth)):
+        with Session() as db:
+            owned_project(db, pid, workspace_id)
         return run_check(pid)
 
     @app.post('/api/ingest/{pid}/heartbeat')
@@ -436,11 +514,11 @@ def create_app(db_url=None, demo=None, scheduler=True):
             return {'id': did, 'status': d.status, 'check': result}
 
     @app.post('/api/projects/{pid}/demo/{action}', dependencies=[Depends(auth)])
-    def drill(pid: str, action: str, request: Request):
+    def drill(pid: str, action: str, request: Request, workspace_id: str = Depends(auth)):
         if request.headers.get('x-confirm-operation') != 'yes':
             raise HTTPException(400, 'Explicit operator confirmation required')
         with lock, Session() as db:
-            p = db.get(Project, pid)
+            p = owned_project(db, pid, workspace_id)
             if not p or not p.demo or not demo:
                 raise HTTPException(403, 'Recovery drill is restricted to seeded synthetic projects')
             if action not in ('pause', 'resume'):
@@ -454,11 +532,12 @@ def create_app(db_url=None, demo=None, scheduler=True):
         return {'executed': True, 'verification_required': True}
 
     @app.patch('/api/incidents/{iid}', dependencies=[Depends(auth)])
-    def update_incident(iid: str, body: IncidentUpdate):
+    def update_incident(iid: str, body: IncidentUpdate, workspace_id: str = Depends(auth)):
         with lock, Session() as db:
             i = db.get(Incident, iid)
             if not i:
                 raise HTTPException(404, 'Incident not found')
+            owned_project(db, i.project_id, workspace_id)
             if i.status == 'resolved':
                 raise HTTPException(409, 'Incident is already resolved')
             if body.action == 'resolve':
@@ -475,11 +554,9 @@ def create_app(db_url=None, demo=None, scheduler=True):
             return {'status': i.status}
 
     @app.get('/api/reports/{cid}', dependencies=[Depends(auth)], response_class=PlainTextResponse)
-    def report(cid: str):
+    def report(cid: str, workspace_id: str = Depends(auth)):
         with Session() as db:
-            client = db.get(Client, cid)
-            if not client:
-                raise HTTPException(404, 'Client not found')
+            client = owned_client(db, cid, workspace_id)
             since = time.time() - 30 * 86400
             lines = [f'# Maintenance report — {client.name}', '', f'Generated: {stamp(time.time())}',
                      'Window: trailing 30 days. Draft for operator review.',

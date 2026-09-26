@@ -21,7 +21,7 @@ If port 8080 is occupied, pass `-Port 8081`. To run an empty, non-demo local wor
 
 ### Sign-in options
 
-The public landing page is shown before authentication. The existing `OPS_TOKEN` operator login remains available. To enable the single workspace administrator's email/password login, set `OPS_ADMIN_EMAIL` and a strong `OPS_ADMIN_PASSWORD` in the hosting environment. There is no public self-registration. To enable Google sign-in, set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `OPS_AUTH_EMAILS` (comma-separated authorized Google addresses; `OPS_ADMIN_EMAIL` is also allowed). Register `https://<your-render-host>/api/auth/google/callback` as an authorized Google OAuth redirect URI and set `GOOGLE_REDIRECT_URI` to that exact URL. Set a stable random `OPS_SESSION_SECRET` for signed OAuth state cookies; keep `OPS_SECURE_COOKIE=true` in production. Never commit these secrets.
+The public landing page is shown before authentication. Anyone can create an email/password account; verified Google sign-in creates an account on first login. **Each account has its own isolated workspace for clients, projects, incidents and reports.** Email/password registration currently does not verify email ownership and there is no password reset or team role management. Google OAuth Testing mode only allows Google test users configured in Google Cloud. The existing `OPS_TOKEN` and optional `OPS_ADMIN_EMAIL` / `OPS_ADMIN_PASSWORD` login remain available. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and `GOOGLE_REDIRECT_URI=https://<your-render-host>/api/auth/google/callback`; keep `OPS_SECURE_COOKIE=true` in production. `OPS_SESSION_SECRET` should be a stable random value to protect OAuth state cookies. Never commit secrets.
 
 ## Implemented
 
@@ -61,13 +61,17 @@ az bicep build --file infra/azure/main.bicep
 
 Backend checks cover auth, project-token isolation/revocation, SSRF restrictions, failed deployment handling, stale heartbeats, guarded resolution and report evidence, plus the original invoice lab. See [validation](docs/validation.md) for actual checks and limitations.
 
+## Render updates
+
+For the existing Render service, see [update and migration instructions](docs/render-update.md).
+
 ## Containers and Azure
 
 Set `OPS_TOKEN` and a URL-safe `POSTGRES_PASSWORD`, then `docker compose up --build`. Compose runs the control plane and PostgreSQL, binding the UI to localhost. Docker Engine is required. See [Azure deployment](docs/azure-deployment.md) for infrastructure prerequisites, network allowlisting, budget considerations and what has not been deployed.
 
 ## Honest scope
 
-This is a functioning single-agency MVP, not a production-certified multi-tenant service. Clients are project groups, not authenticated tenants. Team RBAC, Entra ID login, customer portal, billing, AI investigation, remote production remediation, automatic notifications, backup restore verification, account discovery, tracing instrumentation and distributed scheduling are not implemented. Shared operator sessions live in process memory; deploy one replica. Database schema is initialized with `create_all`; schema migrations and retention are pending.
+Each registered account now has an isolated workspace. Existing shared data remains in the operator-token / configured-admin workspace. Team membership and invitations are not implemented. This is not a production-certified service. Email ownership verification, password reset, team RBAC, Entra ID login, customer portal, billing, AI investigation, remote production remediation, automatic notifications, backup restore verification, account discovery, tracing instrumentation and distributed scheduling are not implemented. Sessions live in process memory; deploy one replica. An additive startup migration adds workspace ownership to existing clients and audit events; deploy one replica during upgrades. General migration tooling and retention remain pending.
 
 The new console's worker drill is a deterministic simulation. The original actual invoice queue lab remains available separately as `app.py` / `web/lab.html` with its original tests; it is not secretly presented as a customer cloud integration. Set `OPS_TOKEN` and `OPS_PORT=8081`, then run `python app.py` to use that lab alongside the SaaS workspace.
 

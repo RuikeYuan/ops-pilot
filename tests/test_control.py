@@ -120,7 +120,7 @@ def test_email_password_login_is_configured_admin_only(tmp_path, monkeypatch):
     monkeypatch.setenv('OPS_AUTH_EMAILS', 'owner@example.com, teammate@example.com')
     app = create_app('sqlite:///' + str(tmp_path / 'password.db'), demo=False, scheduler=False)
     with TestClient(app) as c:
-        assert c.get('/api/config').json() == {'demo': False, 'password_login': True, 'google_login': True}
+        assert c.get('/api/config').json() == {'demo': False, 'password_login': True, 'google_login': True, 'registration': True}
         assert c.post('/api/session', json={'email': 'owner@example.com', 'password': 'wrong-password'}).status_code == 401
         assert c.post('/api/session', json={'email': 'other@example.com', 'password': 'test-password-long-enough'}).status_code == 401
         response = c.post('/api/session', json={'email': 'OWNER@example.com', 'password': 'test-password-long-enough'})
@@ -134,5 +134,69 @@ def test_google_login_is_hidden_until_fully_configured(tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     app = create_app('sqlite:///' + str(tmp_path / 'google-disabled.db'), demo=False, scheduler=False)
     with TestClient(app) as c:
-        assert c.get('/api/config').json() == {'demo': False, 'password_login': False, 'google_login': False}
+        assert c.get('/api/config').json() == {'demo': False, 'password_login': True, 'google_login': False, 'registration': True}
         assert c.get('/api/auth/google').status_code == 404
+
+
+def test_registration_creates_isolated_workspace(client):
+    client.cookies.clear()
+    assert client.get('/api/workspace').status_code == 401
+    initial = client.post('/api/register', json={
+        'email': '  teammate@example.com ',
+        'password': 'strong-password-123',
+    })
+    assert initial.status_code == 200
+    first_workspace = client.get('/api/workspace')
+    assert first_workspace.status_code == 200
+    initial_clients = len(first_workspace.json()['clients'])
+    assert first_workspace.json()['projects'] == []
+
+    assert client.post('/api/register', json={
+        'email': 'TEAMMATE@example.com',
+        'password': 'another-password-123',
+    }).status_code == 409
+    assert client.post('/api/register', json={
+        'email': 'invalid-email',
+        'password': 'strong-password-123',
+    }).status_code == 422
+    assert client.post('/api/register', json={
+        'email': 'other@example.com',
+        'password': 'short',
+    }).status_code == 422
+
+    created = client.post('/api/clients', json={'name': 'Shared team client'})
+    assert created.status_code == 200
+    teammate = TestClient(client.app)
+    with teammate:
+        second_signup = teammate.post('/api/register', json={
+            'email': 'second-member@example.com',
+            'password': 'another-strong-password-456',
+        })
+        assert second_signup.status_code == 200
+        shared = teammate.get('/api/workspace').json()
+        assert shared['clients'] == []
+        assert shared['events'] == []
+    client.cookies.clear()
+    assert client.get('/api/workspace').status_code == 401
+    assert client.post('/api/session', json={
+        'email': 'TEAMMATE@example.com',
+        'password': 'strong-password-123',
+    }).status_code == 200
+    signed_in_workspace = client.get('/api/workspace').json()
+    assert len(signed_in_workspace['clients']) == initial_clients + 1
+    assert any(c['name'] == 'Shared team client' for c in signed_in_workspace['clients'])
+
+
+def test_registration_password_is_not_stored_in_plaintext(tmp_path, monkeypatch):
+    monkeypatch.setenv('OPS_TOKEN', 'test-operator-token-at-least-24-characters')
+    app = create_app('sqlite:///' + str(tmp_path / 'accounts.db'), demo=False, scheduler=False)
+    with TestClient(app) as c:
+        assert c.post('/api/register', json={
+            'email': 'member@example.com',
+            'password': 'very-secure-password',
+        }).status_code == 200
+        with app.state.session_factory() as db:
+            from control.db import Account
+            account = db.scalar(select(Account).where(Account.email == 'member@example.com'))
+            assert account.password_hash != 'very-secure-password'
+            assert account.password_salt
