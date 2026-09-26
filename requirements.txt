@@ -2,3 +2,5 @@ fastapi==0.141.1
 uvicorn==0.54.0
 SQLAlchemy==2.1.1
 psycopg[binary]==3.3.6
+Authlib==1.6.9
+itsdangerous==2.2.0

@@ -19,6 +19,10 @@ The launcher creates a virtual environment, installs pinned direct dependencies,
 
 If port 8080 is occupied, pass `-Port 8081`. To run an empty, non-demo local workspace, set a strong `OPS_TOKEN` (24+ characters) and run `start.ps1 -Live`. Demo and live launch modes use separate default SQLite files. For cloud use, set PostgreSQL `DATABASE_URL`, disable demo access and enable secure cookies behind HTTPS.
 
+### Sign-in options
+
+The public landing page is shown before authentication. The existing `OPS_TOKEN` operator login remains available. To enable the single workspace administrator's email/password login, set `OPS_ADMIN_EMAIL` and a strong `OPS_ADMIN_PASSWORD` in the hosting environment. There is no public self-registration. To enable Google sign-in, set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `OPS_AUTH_EMAILS` (comma-separated authorized Google addresses; `OPS_ADMIN_EMAIL` is also allowed). Register `https://<your-render-host>/api/auth/google/callback` as an authorized Google OAuth redirect URI and set `GOOGLE_REDIRECT_URI` to that exact URL. Set a stable random `OPS_SESSION_SECRET` for signed OAuth state cookies; keep `OPS_SECURE_COOKIE=true` in production. Never commit these secrets.
+
 ## Implemented
 
 - Responsive SaaS interface: overview, projects, clients, incidents, releases, reports, connections, runbooks and workspace information.

@@ -108,3 +108,31 @@ def test_non_demo_requires_operator_and_disables_demo_login(tmp_path, monkeypatc
         assert c.post('/api/session', json={'demo': True}).status_code == 401
         assert c.post('/api/session', json={'token': 'test-operator-token-at-least-24-characters'}).status_code == 200
         assert c.get('/api/workspace').json()['projects'] == []
+
+
+def test_email_password_login_is_configured_admin_only(tmp_path, monkeypatch):
+    monkeypatch.setenv('OPS_TOKEN', 'test-operator-token-at-least-24-characters')
+    monkeypatch.setenv('OPS_ADMIN_EMAIL', 'owner@example.com')
+    monkeypatch.setenv('OPS_ADMIN_PASSWORD', 'test-password-long-enough')
+    monkeypatch.setenv('OPS_SESSION_SECRET', 'test-session-secret-long-enough')
+    monkeypatch.setenv('GOOGLE_CLIENT_ID', 'google-client-id')
+    monkeypatch.setenv('GOOGLE_CLIENT_SECRET', 'google-client-secret')
+    monkeypatch.setenv('OPS_AUTH_EMAILS', 'owner@example.com, teammate@example.com')
+    app = create_app('sqlite:///' + str(tmp_path / 'password.db'), demo=False, scheduler=False)
+    with TestClient(app) as c:
+        assert c.get('/api/config').json() == {'demo': False, 'password_login': True, 'google_login': True}
+        assert c.post('/api/session', json={'email': 'owner@example.com', 'password': 'wrong-password'}).status_code == 401
+        assert c.post('/api/session', json={'email': 'other@example.com', 'password': 'test-password-long-enough'}).status_code == 401
+        response = c.post('/api/session', json={'email': 'OWNER@example.com', 'password': 'test-password-long-enough'})
+        assert response.status_code == 200
+        assert c.get('/api/workspace').status_code == 200
+
+
+def test_google_login_is_hidden_until_fully_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv('OPS_TOKEN', 'test-operator-token-at-least-24-characters')
+    for name in ('OPS_ADMIN_EMAIL', 'OPS_ADMIN_PASSWORD', 'OPS_AUTH_EMAILS', 'GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'):
+        monkeypatch.delenv(name, raising=False)
+    app = create_app('sqlite:///' + str(tmp_path / 'google-disabled.db'), demo=False, scheduler=False)
+    with TestClient(app) as c:
+        assert c.get('/api/config').json() == {'demo': False, 'password_login': False, 'google_login': False}
+        assert c.get('/api/auth/google').status_code == 404

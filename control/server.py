@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
+from authlib.integrations.starlette_client import OAuth
+from starlette.middleware.sessions import SessionMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -29,6 +31,8 @@ log = logging.getLogger('opspilot')
 class Login(BaseModel):
     token: str = ''
     demo: bool = False
+    email: str = ''
+    password: str = ''
 
 
 class NewClient(BaseModel):
@@ -80,6 +84,15 @@ def create_app(db_url=None, demo=None, scheduler=True):
     attempts = {}
     lock = threading.RLock()
     secure = os.getenv('OPS_SECURE_COOKIE', 'false').lower() == 'true'
+    admin_email = os.getenv('OPS_ADMIN_EMAIL', '').strip().lower()
+    admin_password = os.getenv('OPS_ADMIN_PASSWORD', '')
+    allowed_emails = {email.strip().lower() for email in os.getenv('OPS_AUTH_EMAILS', '').split(',') if email.strip()}
+    if admin_email:
+        allowed_emails.add(admin_email)
+    google_client_id = os.getenv('GOOGLE_CLIENT_ID', '')
+    google_client_secret = os.getenv('GOOGLE_CLIENT_SECRET', '')
+    google_enabled = bool(google_client_id and google_client_secret and allowed_emails)
+    session_secret = os.getenv('OPS_SESSION_SECRET') or operator_token or secrets.token_urlsafe(32)
 
     def event(db, project_id, kind, detail):
         db.add(Event(project_id=project_id, kind=kind, detail=detail))
@@ -161,6 +174,7 @@ def create_app(db_url=None, demo=None, scheduler=True):
         engine.dispose()
 
     app = FastAPI(title='OpsPilot control plane', version='0.2.0', lifespan=lifespan)
+    app.add_middleware(SessionMiddleware, secret_key=session_secret, same_site='lax', https_only=secure)
     app.state.session_factory = Session
     app.state.run_check = run_check
     app.state.scheduled_checks = scheduled_checks
@@ -210,7 +224,22 @@ def create_app(db_url=None, demo=None, scheduler=True):
 
     @app.get('/api/config')
     def config():
-        return {'demo': demo}
+        return {'demo': demo, 'password_login': bool(admin_email and admin_password), 'google_login': google_enabled}
+
+    oauth = OAuth()
+    if google_enabled:
+        oauth.register(
+            name='google',
+            server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+            client_id=google_client_id,
+            client_secret=google_client_secret,
+            client_kwargs={'scope': 'openid email profile'},
+        )
+
+    def issue_session(response: Response):
+        key = secrets.token_urlsafe(32)
+        sessions[digest(key)] = time.time() + 28800
+        response.set_cookie('ops_session', key, httponly=True, samesite='strict', secure=secure, max_age=28800)
 
     @app.post('/api/session')
     def login(body: Login, request: Request, response: Response):
@@ -219,16 +248,45 @@ def create_app(db_url=None, demo=None, scheduler=True):
         attempts[host] = recent
         if len(recent) >= 10:
             raise HTTPException(429, 'Too many attempts; try again in five minutes')
-        if not ((body.demo and demo) or (operator_token and hmac.compare_digest(body.token, operator_token))):
+        email = body.email.strip().lower()
+        token_ok = bool(operator_token and hmac.compare_digest(body.token, operator_token))
+        password_ok = bool(
+            admin_email and admin_password
+            and hmac.compare_digest(email.encode(), admin_email.encode())
+            and hmac.compare_digest(body.password.encode(), admin_password.encode())
+        )
+        if not ((body.demo and demo) or token_ok or password_ok):
             recent.append(time.time())
-            raise HTTPException(401, 'Incorrect workspace token')
+            raise HTTPException(401, 'Invalid sign-in details')
         for k, expiry in list(sessions.items()):
             if expiry < time.time():
                 del sessions[k]
-        key = secrets.token_urlsafe(32)
-        sessions[digest(key)] = time.time() + 28800
-        response.set_cookie('ops_session', key, httponly=True, samesite='strict', secure=secure, max_age=28800)
+        issue_session(response)
         return {'ok': True}
+
+    @app.get('/api/auth/google')
+    async def google_login(request: Request):
+        if not google_enabled:
+            raise HTTPException(404, 'Google sign-in is not configured')
+        redirect_uri = os.getenv('GOOGLE_REDIRECT_URI') or str(request.url_for('google_callback'))
+        return await oauth.google.authorize_redirect(request, redirect_uri)
+
+    @app.get('/api/auth/google/callback', name='google_callback')
+    async def google_callback(request: Request):
+        if not google_enabled:
+            raise HTTPException(404, 'Google sign-in is not configured')
+        try:
+            token = await oauth.google.authorize_access_token(request)
+            userinfo = token.get('userinfo') or await oauth.google.userinfo(token=token)
+        except Exception:
+            log.exception('Google OAuth callback failed')
+            return PlainTextResponse('Google sign-in failed. Return to OpsPilot and try again.', status_code=401)
+        email = str(userinfo.get('email', '')).strip().lower()
+        if userinfo.get('email_verified') is not True or email not in allowed_emails:
+            return PlainTextResponse('This Google account is not authorized for this workspace.', status_code=403)
+        response = RedirectResponse('/', status_code=303)
+        issue_session(response)
+        return response
 
     @app.delete('/api/session')
     def logout(request: Request, response: Response):
