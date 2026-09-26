@@ -1,0 +1,14 @@
+{
+  "app_url": "https://your-dutch-app.example",
+  "supabase_url": "https://your-project.supabase.co",
+  "email": "",
+  "password": "",
+  "expected_user_id": "",
+  "fixture_source_id": "C1",
+  "fixture_level": 1,
+  "browser_channel": "msedge",
+  "timeout_ms": 15000,
+  "opspilot_url": "http://127.0.0.1:8080",
+  "opspilot_project_id": "",
+  "opspilot_project_token": ""
+}

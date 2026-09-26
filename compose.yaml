@@ -1,0 +1,31 @@
+services:
+  control:
+    build: .
+    ports: ["127.0.0.1:8081:8080"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://opspilot:${POSTGRES_PASSWORD:?Set a URL-safe POSTGRES_PASSWORD}@database:5432/opspilot
+      OPS_TOKEN: ${OPS_TOKEN:?Set OPS_TOKEN to at least 24 characters}
+      OPS_DEMO: ${OPS_DEMO:-false}
+      OPS_WORKSPACE: ${OPS_WORKSPACE:-My studio}
+      PORT: "8080"
+    depends_on:
+      database: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+  database:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: opspilot
+      POSTGRES_DB: opspilot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U opspilot -d opspilot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  pg-data:
